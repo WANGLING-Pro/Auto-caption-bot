@@ -27,6 +27,7 @@ from pyrogram import Client  # noqa: E402  (must import after the shim above)
 
 from config import Config
 from utils.logger import LOGGER
+from utils.keep_alive import start_keep_alive_server
 
 Config.validate()
 
@@ -39,6 +40,11 @@ app = Client(
 )
 
 if __name__ == "__main__":
+    # Bind $PORT first so Render's port scan succeeds immediately, then
+    # hand control to Pyrogram's blocking run() -- the HTTP server keeps
+    # answering in its own thread for the lifetime of the process.
+    start_keep_alive_server()
+
     LOGGER.info(f"Starting {Config.BOT_NAME}...")
     app.run()
     LOGGER.info("Bot stopped.")
