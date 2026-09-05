@@ -127,3 +127,5 @@ async def total_edited_messages() -> int:
     pipeline = [{"$group": {"_id": None, "total": {"$sum": "$stats.edited_messages"}}}]
     result = await channels_col.aggregate(pipeline).to_list(length=1)
     return result[0]["total"] if result else 0
+
+# hhsisja
