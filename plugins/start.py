@@ -9,11 +9,13 @@ everyone else gets a plain welcome message).
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant
+from pyrogram.enums import ChatMemberStatus
 
 from config import Config
 from database.users import add_user_if_new
 from utils.keyboards import main_menu
 from utils.logger import LOGGER
+from utils.state import clear_pending
 
 
 async def is_subscribed(client: Client, user_id: int) -> bool:
@@ -21,7 +23,15 @@ async def is_subscribed(client: Client, user_id: int) -> bool:
         return True
     try:
         member = await client.get_chat_member(Config.FORCE_SUB_CHANNEL, user_id)
-        return member.status not in ("left", "kicked")
+        # BUG FIX: `member.status` is a `pyrogram.enums.ChatMemberStatus` enum
+        # member, not a plain string. The original code compared it against
+        # the strings "left" and "kicked", which never matched -- Pyrogram
+        # doesn't even use "kicked" as a name (it uses `BANNED`) -- so this
+        # check silently evaluated to True for every status Telegram
+        # returned without raising UserNotParticipant, including members who
+        # had actually left. Comparing against the actual enum members below
+        # makes this check behave as originally intended.
+        return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
     except UserNotParticipant:
         return False
     except Exception as e:
@@ -49,6 +59,15 @@ async def start_handler(client: Client, message: Message):
             reply_markup=force_sub_markup(),
         )
         return
+
+    # ROBUSTNESS FIX (related to the collision bug in edit_channel.py):
+    # /start is the natural "escape hatch" out of any in-progress conversation
+    # (Add Channel forward-wait, Edit Channel free-text prompts, etc). Clear
+    # any stale pending state here so a leftover `awaiting_*` flag from an
+    # abandoned flow can never be picked up by a later, unrelated message.
+    # This does not remove or change any existing feature -- it only resets
+    # state that would otherwise be orphaned.
+    clear_pending(user.id)
 
     if user.id in Config.ADMINS:
         await message.reply_text(
