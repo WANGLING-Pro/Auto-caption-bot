@@ -1,3 +1,4 @@
+# edit_channel.py
 """
 plugins/edit_channel.py
 ------------------------
@@ -14,6 +15,7 @@ from utils.filters import admin_only
 from utils.keyboards import channel_list, channel_panel, confirm_cancel, back_to_panel
 from utils.state import set_pending, get_pending, clear_pending
 from utils.caption_builder import build_caption
+from utils.html_entities import parse_html
 from database.channels import (
     get_channel,
     get_user_channels,
@@ -42,17 +44,7 @@ TEXT_FIELDS = {
 # private text message from an admin -- including commands -- and because
 # Pyrogram's plugin loader registers handlers in alphabetical filename order
 # ("edit_channel.py" loads before "start.py"), this handler was intercepting
-# `/start` before start.py's handler ever got a chance to run. It would
-# `return` early (no pending conversation) and Pyrogram would treat the
-# update as handled for that group, so start_handler was silently skipped.
-#
-# NOT_COMMAND makes this explicit and version-independent: any message whose
-# text starts with "/" is excluded from the free-text conversation capture,
-# regardless of which specific command it is or how many command handlers
-# exist elsewhere in the project. This fixes the collision for /start AND
-# for every other current or future command, and does not depend on plugin
-# load order, handler registration order, or Pyrogram's internal `filters
-# .command` implementation details.
+# `/start` before start.py's handler ever got a chance to run.
 NOT_COMMAND = filters.create(lambda _, __, m: not (m.text or "").startswith("/"))
 
 
@@ -128,9 +120,6 @@ async def prompt_text_field(client: Client, query):
     )
 
 
-# NOTE the added `& NOT_COMMAND` below -- this is the actual fix. Everything
-# else about this handler (its purpose, its branches, its pending-state
-# logic) is unchanged.
 @Client.on_message(filters.private & filters.text & NOT_COMMAND & admin_only)
 async def capture_text_input(client: Client, message: Message):
     pending = get_pending(message.from_user.id)
@@ -274,8 +263,20 @@ async def preview(client: Client, query):
         "tagline: 'Best Quality Since 2019'."
     )
     rendered = build_caption(sample, channel)
+
+    # FORMATTING FIX: build the *entire* displayed string (including the
+    # "Preview" heading and the divider) as one HTML string, then convert it
+    # ALL AT ONCE with parse_html(). Converting `rendered` alone and the
+    # static prefix separately would produce two independent entity lists
+    # with offsets relative to each fragment, not to the final combined
+    # text -- entities have to be computed against the final string as a
+    # whole or they land in the wrong place.
+    full_html = f"👁 <b>Preview</b> (using sample data)\n\n{'-' * 20}\n\n{rendered}"
+    plain_text, entities = parse_html(full_html)
+
     await query.message.edit_text(
-        f"👁 <b>Preview</b> (using sample data)\n\n{'-'*20}\n\n{rendered}",
+        plain_text,
+        entities=entities,
         reply_markup=back_to_panel(channel_id),
     )
 
