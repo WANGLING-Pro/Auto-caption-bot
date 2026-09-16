@@ -35,6 +35,26 @@ TEXT_FIELDS = {
     "set_watermark": ("watermark", "💧 Send the watermark text (rendered as a blockquote)."),
 }
 
+# --- BUG FIX (root cause of /start and other commands not responding) ------
+# `filters.text` in Pyrogram matches ANY message with a non-empty `.text`,
+# including slash-commands ("/start", "/broadcast", etc. are text messages
+# too). Without this exclusion, `capture_text_input` below matches every
+# private text message from an admin -- including commands -- and because
+# Pyrogram's plugin loader registers handlers in alphabetical filename order
+# ("edit_channel.py" loads before "start.py"), this handler was intercepting
+# `/start` before start.py's handler ever got a chance to run. It would
+# `return` early (no pending conversation) and Pyrogram would treat the
+# update as handled for that group, so start_handler was silently skipped.
+#
+# NOT_COMMAND makes this explicit and version-independent: any message whose
+# text starts with "/" is excluded from the free-text conversation capture,
+# regardless of which specific command it is or how many command handlers
+# exist elsewhere in the project. This fixes the collision for /start AND
+# for every other current or future command, and does not depend on plugin
+# load order, handler registration order, or Pyrogram's internal `filters
+# .command` implementation details.
+NOT_COMMAND = filters.create(lambda _, __, m: not (m.text or "").startswith("/"))
+
 
 async def _render_panel(query_or_message, channel_id: int, edit: bool = True):
     channel = await get_channel(channel_id)
@@ -108,7 +128,10 @@ async def prompt_text_field(client: Client, query):
     )
 
 
-@Client.on_message(filters.private & filters.text & admin_only)
+# NOTE the added `& NOT_COMMAND` below -- this is the actual fix. Everything
+# else about this handler (its purpose, its branches, its pending-state
+# logic) is unchanged.
+@Client.on_message(filters.private & filters.text & NOT_COMMAND & admin_only)
 async def capture_text_input(client: Client, message: Message):
     pending = get_pending(message.from_user.id)
     if not pending:
