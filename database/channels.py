@@ -24,8 +24,13 @@ Schema (one document per channel):
     },
     "created_at": <datetime>,
 }
+
+Review fix: DEFAULT_SETTINGS is deep-copied (copy.deepcopy) wherever it is
+stored, so the shared `replace_words` / `remove_words` lists can never be
+aliased between channels.
 """
 
+import copy
 from datetime import datetime, timezone
 from database.mongo import channels_col
 
@@ -40,6 +45,10 @@ DEFAULT_SETTINGS = {
 }
 
 
+def default_settings() -> dict:
+    return copy.deepcopy(DEFAULT_SETTINGS)
+
+
 async def add_channel(channel_id: int, owner_id: int, title: str, username: str | None):
     """Insert a new channel, or return the existing doc if already added."""
     existing = await channels_col.find_one({"_id": channel_id})
@@ -52,7 +61,7 @@ async def add_channel(channel_id: int, owner_id: int, title: str, username: str 
         "title": title,
         "username": username,
         "verified_admin": True,   # set True only after the add-flow confirms bot admin status
-        "settings": dict(DEFAULT_SETTINGS),
+        "settings": default_settings(),
         "stats": {"edited_messages": 0},
         "created_at": datetime.now(timezone.utc),
     }
@@ -81,7 +90,7 @@ async def update_settings(channel_id: int, **fields):
 
 async def reset_settings(channel_id: int):
     await channels_col.update_one(
-        {"_id": channel_id}, {"$set": {"settings": dict(DEFAULT_SETTINGS)}}
+        {"_id": channel_id}, {"$set": {"settings": default_settings()}}
     )
 
 
@@ -127,5 +136,3 @@ async def total_edited_messages() -> int:
     pipeline = [{"$group": {"_id": None, "total": {"$sum": "$stats.edited_messages"}}}]
     result = await channels_col.aggregate(pipeline).to_list(length=1)
     return result[0]["total"] if result else 0
-
-# hhsisja
