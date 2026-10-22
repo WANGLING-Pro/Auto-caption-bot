@@ -1,4 +1,13 @@
-pyrogram==2.0.106
+# IMPORTANT: install ONLY ONE of pyrogram / pyrofork -- both provide the module
+# name "pyrogram" and clobber each other. In Render: clear build cache & redeploy
+# after changing this file.
+#
+# Stock pyrogram==2.0.106 (last official release) predates Telegram's expandable
+# blockquote (Bot API 7.4), so <blockquote expandable> cannot be sent with it.
+# pyrofork is a maintained fork with the same `import pyrogram` API.
+# After the first good deploy, run `pip freeze | grep -i pyrofork` and pin the
+# exact version here.
+pyrofork
 tgcrypto==1.2.5
 motor==3.5.1
 python-dotenv==1.0.1
