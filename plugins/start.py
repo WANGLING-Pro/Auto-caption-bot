@@ -4,7 +4,21 @@ plugins/start.py
 /start command: registers the user, enforces Force Subscribe if configured,
 and shows the main admin panel (only admins get the management buttons;
 everyone else gets a plain welcome message).
+
+Review changes
+--------------
+* Registered with group=-1. In Pyrogram only the FIRST matching handler of a
+  group runs, and plugin files load alphabetically (add_channel, auto_caption,
+  backup, broadcast, edit_channel, ... start). The old edit_channel text
+  handler matched "/start" for admins, returned, and start_handler (loaded
+  later) never ran -- that was the original "/start does not respond" bug.
+  Putting commands in their own group makes them independent of whatever
+  group-0 text handlers exist or get added later.
+* The user's first name is HTML-escaped (names like "A <b>" broke the message).
+* Debug log line so you can see /start arriving in the Render log.
 """
+
+import html
 
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -23,14 +37,7 @@ async def is_subscribed(client: Client, user_id: int) -> bool:
         return True
     try:
         member = await client.get_chat_member(Config.FORCE_SUB_CHANNEL, user_id)
-        # BUG FIX: `member.status` is a `pyrogram.enums.ChatMemberStatus` enum
-        # member, not a plain string. The original code compared it against
-        # the strings "left" and "kicked", which never matched -- Pyrogram
-        # doesn't even use "kicked" as a name (it uses `BANNED`) -- so this
-        # check silently evaluated to True for every status Telegram
-        # returned without raising UserNotParticipant, including members who
-        # had actually left. Comparing against the actual enum members below
-        # makes this check behave as originally intended.
+        # `member.status` is a ChatMemberStatus enum member (not a string).
         return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
     except UserNotParticipant:
         return False
@@ -48,9 +55,12 @@ def force_sub_markup() -> InlineKeyboardMarkup:
     )
 
 
-@Client.on_message(filters.command("start") & filters.private)
+@Client.on_message(filters.command("start") & filters.private, group=-1)
 async def start_handler(client: Client, message: Message):
     user = message.from_user
+    if not user:
+        return
+    LOGGER.info(f"[start] /start from user={user.id} admin={user.id in Config.ADMINS}")
     await add_user_if_new(user.id, user.first_name or "", user.username)
 
     if not await is_subscribed(client, user.id):
@@ -60,24 +70,19 @@ async def start_handler(client: Client, message: Message):
         )
         return
 
-    # ROBUSTNESS FIX (related to the collision bug in edit_channel.py):
-    # /start is the natural "escape hatch" out of any in-progress conversation
-    # (Add Channel forward-wait, Edit Channel free-text prompts, etc). Clear
-    # any stale pending state here so a leftover `awaiting_*` flag from an
-    # abandoned flow can never be picked up by a later, unrelated message.
-    # This does not remove or change any existing feature -- it only resets
-    # state that would otherwise be orphaned.
+    # /start is the escape hatch out of any in-progress conversation.
     clear_pending(user.id)
 
+    name = html.escape(user.first_name or "", quote=False)
     if user.id in Config.ADMINS:
         await message.reply_text(
-            f"👋 Welcome back, {user.first_name}!\n\n"
+            f"👋 Welcome back, {name}!\n\n"
             "Manage your channels' auto-captioning below.",
             reply_markup=main_menu(),
         )
     else:
         await message.reply_text(
-            f"👋 Hello {user.first_name}!\n\n"
+            f"👋 Hello {name}!\n\n"
             "This bot automatically formats captions for channels its "
             "administrators have configured it on."
         )
