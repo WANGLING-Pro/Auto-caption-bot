@@ -1,10 +1,15 @@
 """
 plugins/broadcast.py
 ---------------------
-Simple /broadcast command for admins: replies with the message to forward,
-and it gets copied to every user who has started the bot.
+Simple /broadcast command for admins: reply to a message with /broadcast, or
+send /broadcast <text>; it is copied to every user who has started the bot.
 
-Usage: reply to any message with /broadcast, or send /broadcast <text>.
+Review fixes
+------------
+* A FloodWait used to `sleep` and then silently SKIP that user (neither sent
+  nor failed). The send is now retried once after the wait.
+* Registered in group=-1 so it can never be shadowed by a text handler that
+  lives in group 0.
 """
 
 import asyncio
@@ -18,7 +23,14 @@ from database.users import get_all_user_ids
 from utils.logger import LOGGER
 
 
-@Client.on_message(filters.command("broadcast") & filters.private & admin_only)
+async def _send(client: Client, source, text, uid: int):
+    if source:
+        await source.copy(uid)
+    else:
+        await client.send_message(uid, text)
+
+
+@Client.on_message(filters.command("broadcast") & filters.private & admin_only, group=-1)
 async def broadcast_handler(client: Client, message: Message):
     source = message.reply_to_message
     text_arg = message.text.split(None, 1)
@@ -29,22 +41,23 @@ async def broadcast_handler(client: Client, message: Message):
         )
         return
 
+    text = text_arg[1] if len(text_arg) > 1 else None
     user_ids = await get_all_user_ids()
     status = await message.reply_text(f"📣 Broadcasting to {len(user_ids)} users...")
 
     sent, failed = 0, 0
     for uid in user_ids:
         try:
-            if source:
-                await source.copy(uid)
-            else:
-                await client.send_message(uid, text_arg[1])
+            try:
+                await _send(client, source, text, uid)
+            except FloodWait as e:
+                LOGGER.warning(f"[broadcast] FloodWait {e.value}s, retrying user {uid} once")
+                await asyncio.sleep(e.value)
+                await _send(client, source, text, uid)
             sent += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
         except Exception as e:
             failed += 1
-            LOGGER.debug(f"Broadcast failed for {uid}: {e}")
+            LOGGER.debug(f"[broadcast] failed for {uid}: {e}")
         await asyncio.sleep(0.05)  # gentle rate limiting
 
     await status.edit_text(f"✅ Broadcast complete.\nSent: {sent}\nFailed: {failed}")
