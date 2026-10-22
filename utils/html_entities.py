@@ -2,92 +2,106 @@
 """
 utils/html_entities.py
 ------------------------
-A small, self-contained HTML -> (plain_text, entities) converter.
+Small, self-contained HTML -> (plain_text, entities) converter.
 
-WHY THIS EXISTS
-----------------
-Every caption in this bot is built as an HTML string by
-utils/caption_builder.py and previously handed to Pyrogram's send/edit
-methods relying on the client's *default* parse_mode. That is fine for
-long-standing tags (<b>, <i>, <code>, ...), but <blockquote> and especially
-<blockquote expandable> are a comparatively new Telegram feature (Bot API
-7.5, ~April 2024), and whether a given Pyrogram build's *own* HTML parser
-recognizes them is not guaranteed just because the tag looks syntactically
-correct -- if the installed parser has no code path for "blockquote", the
-literal tag text passes straight through unconverted, which is exactly the
-"raw text" symptom being investigated.
+Why it exists
+-------------
+Used for two things:
+  1. Getting the *plain text* of a caption (length limits, debugging).
+  2. Building explicit MessageEntity objects when the installed Pyrogram
+     build's own HTML parser does not understand <blockquote>
+     (see utils/formatting.py, which decides which path to use).
 
-This module removes that dependency entirely: it parses the bot's own HTML
-itself, using Python's standard library `html.parser.HTMLParser`, and
-returns plain text plus an explicit list of `pyrogram.types.MessageEntity`
-objects. Callers pass `entities=`/`caption_entities=` directly instead of
-`parse_mode=`, so Pyrogram never needs to parse the tags at all -- the
-correctness of blockquote rendering now depends only on whether your
-installed Pyrogram's *protocol layer* (MessageEntityType.BLOCKQUOTE) can
-serialize the entity, not on its HTML tag parser.
-
-SUPPORTED TAGS (matches README's documented "HTML formatting" section):
-    <b> <strong>          -> bold
-    <i> <em>               -> italic
-    <u>                     -> underline
-    <s> <strike> <del>       -> strikethrough
-    <code>                    -> code
-    <pre>                      -> pre
-    <a href="...">              -> text link
-    <blockquote>                  -> blockquote
-    <blockquote expandable>        -> expandable/collapsible blockquote
-
-VERIFY BEFORE RELYING ON THIS IN PRODUCTION:
-    The exact keyword Pyrogram uses on `MessageEntity` for the "expandable"
-    flag on a blockquote is NOT something I can confirm without your actual
-    installed package (no network access in this environment). It is set
-    below via the single constant `BLOCKQUOTE_EXPANDABLE_KWARG`. Run:
-
-        import inspect
-        from pyrogram.types import MessageEntity
-        print(inspect.signature(MessageEntity.__init__))
-
-    and change the constant below if your installed version reports a
-    different name (e.g. "expandable" instead of "collapsed").
+What changed vs. the previous version (review fixes)
+----------------------------------------------------
+* NEVER raises on an unsupported library feature. The old version raised
+  RuntimeError (no BLOCKQUOTE type) or TypeError (MessageEntity(...,
+  collapsed=True) on a build whose MessageEntity has no such parameter),
+  which killed auto-captioning and the Preview button outright.
+  Now it degrades: expandable -> normal blockquote -> plain text, and logs
+  one warning.
+* The "expandable" flag is detected from the installed library instead of
+  being a hard-coded guess (EXPANDABLE_BLOCKQUOTE enum member, or a
+  `collapsed` / `expandable` MessageEntity parameter).
+* Entities are sorted by (offset, -length) so an outer entity always comes
+  before the inner one that starts at the same offset.
+* Unclosed tags are closed at end of text instead of being dropped.
+* Nested <blockquote> is flattened (Telegram does not allow it).
+* Extra tags: <br>, <tg-spoiler>, <span class="tg-spoiler">,
+  <pre language="...">.
 """
 
-from dataclasses import dataclass, field
+import html as _html
+import inspect
+import re
+from dataclasses import dataclass
 from html.parser import HTMLParser
 
 from pyrogram.types import MessageEntity
 from pyrogram.enums import MessageEntityType
 
-# --- See "VERIFY BEFORE RELYING ON THIS IN PRODUCTION" above ---
-BLOCKQUOTE_EXPANDABLE_KWARG = "collapsed"
+from utils.logger import LOGGER
 
-# Detect at import time whether this Pyrogram build even has the entity
-# type at all, so failures are loud and specific instead of a confusing
-# traceback deep inside a send call.
-BLOCKQUOTE_SUPPORTED = hasattr(MessageEntityType, "BLOCKQUOTE")
+
+def _enum(name: str):
+    return getattr(MessageEntityType, name, None)
+
+
+def _entity_params() -> set:
+    try:
+        return set(inspect.signature(MessageEntity.__init__).parameters)
+    except (TypeError, ValueError):
+        return set()
+
+
+_PARAMS = _entity_params()
+BLOCKQUOTE = _enum("BLOCKQUOTE")
+EXPANDABLE_BLOCKQUOTE = _enum("EXPANDABLE_BLOCKQUOTE")
+SPOILER = _enum("SPOILER")
+_EXPANDABLE_KWARG = next((k for k in ("collapsed", "expandable") if k in _PARAMS), None)
+
+
+def entity_capabilities() -> dict:
+    """What the installed Pyrogram build can express through MessageEntity."""
+    return {
+        "blockquote": BLOCKQUOTE is not None or EXPANDABLE_BLOCKQUOTE is not None,
+        "expandable_via_entities": EXPANDABLE_BLOCKQUOTE is not None
+        or (BLOCKQUOTE is not None and _EXPANDABLE_KWARG is not None),
+        "expandable_kwarg": _EXPANDABLE_KWARG,
+        "has_EXPANDABLE_BLOCKQUOTE_enum": EXPANDABLE_BLOCKQUOTE is not None,
+        "has_SPOILER_enum": SPOILER is not None,
+    }
+
 
 _TAG_TO_ENTITY = {
-    "b": MessageEntityType.BOLD,
-    "strong": MessageEntityType.BOLD,
-    "i": MessageEntityType.ITALIC,
-    "em": MessageEntityType.ITALIC,
-    "u": MessageEntityType.UNDERLINE,
-    "s": MessageEntityType.STRIKETHROUGH,
-    "strike": MessageEntityType.STRIKETHROUGH,
-    "del": MessageEntityType.STRIKETHROUGH,
-    "code": MessageEntityType.CODE,
-    "pre": MessageEntityType.PRE,
-    # "a" and "blockquote" are handled specially below (need extra data).
+    name: etype
+    for name, etype in {
+        "b": _enum("BOLD"),
+        "strong": _enum("BOLD"),
+        "i": _enum("ITALIC"),
+        "em": _enum("ITALIC"),
+        "u": _enum("UNDERLINE"),
+        "s": _enum("STRIKETHROUGH"),
+        "strike": _enum("STRIKETHROUGH"),
+        "del": _enum("STRIKETHROUGH"),
+        "code": _enum("CODE"),
+        "pre": _enum("PRE"),
+        "tg-spoiler": SPOILER,
+    }.items()
+    if etype is not None
 }
+
+_warned: set = set()
+
+
+def _warn_once(key: str, message: str):
+    if key not in _warned:
+        _warned.add(key)
+        LOGGER.warning(f"[html_entities] {message}")
 
 
 def _utf16_len(text: str) -> int:
-    """
-    Telegram entity offsets/lengths are counted in UTF-16 code units, not
-    Python string indices. A character outside the Basic Multilingual Plane
-    (many emoji) is 1 Python codepoint but 2 UTF-16 code units, so this
-    conversion is required for correct offsets whenever such characters can
-    appear (channel titles, user-entered header/footer/watermark text, etc).
-    """
+    """Telegram entity offsets/lengths are UTF-16 code units, not Python chars."""
     return len(text.encode("utf-16-le")) // 2
 
 
@@ -96,7 +110,9 @@ class _OpenTag:
     name: str
     start_offset: int
     href: str | None = None
+    language: str | None = None
     expandable: bool = False
+    noop: bool = False  # e.g. a nested blockquote: parsed but emits nothing
 
 
 class _EntityHTMLParser(HTMLParser):
@@ -104,90 +120,130 @@ class _EntityHTMLParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.plain_parts: list[str] = []
         self.entities: list[MessageEntity] = []
-        self._offset = 0  # running UTF-16 offset into the plain text so far
+        self._offset = 0
         self._stack: list[_OpenTag] = []
 
+    # ---- helpers -------------------------------------------------------
+    def _add(self, **kwargs):
+        try:
+            self.entities.append(MessageEntity(**kwargs))
+        except TypeError as e:  # unsupported kwarg on this build
+            _warn_once("entity_typeerror", f"MessageEntity rejected {kwargs.keys()}: {e}")
+
+    def _emit(self, tag: _OpenTag):
+        length = self._offset - tag.start_offset
+        if length <= 0 or tag.noop:
+            return
+        base = {"offset": tag.start_offset, "length": length}
+
+        if tag.name == "a":
+            if tag.href:
+                self._add(type=_enum("TEXT_LINK"), url=tag.href, **base)
+        elif tag.name == "blockquote":
+            self._emit_blockquote(tag, base)
+        elif tag.name == "pre":
+            kwargs = dict(type=_TAG_TO_ENTITY.get("pre"), **base)
+            if tag.language and "language" in _PARAMS:
+                kwargs["language"] = tag.language
+            if kwargs["type"] is not None:
+                self._add(**kwargs)
+        else:
+            etype = _TAG_TO_ENTITY.get(tag.name)
+            if etype is not None:
+                self._add(type=etype, **base)
+
+    def _emit_blockquote(self, tag: _OpenTag, base: dict):
+        if BLOCKQUOTE is None and EXPANDABLE_BLOCKQUOTE is None:
+            _warn_once(
+                "no_blockquote",
+                "Installed Pyrogram has no blockquote entity type at all -> "
+                "blockquote text is sent as plain text. Upgrade the library "
+                "(see requirements.txt).",
+            )
+            return
+
+        if tag.expandable:
+            if EXPANDABLE_BLOCKQUOTE is not None:
+                self._add(type=EXPANDABLE_BLOCKQUOTE, **base)
+                return
+            if BLOCKQUOTE is not None and _EXPANDABLE_KWARG:
+                self._add(type=BLOCKQUOTE, **{_EXPANDABLE_KWARG: True}, **base)
+                return
+            _warn_once(
+                "no_expandable",
+                "Installed Pyrogram cannot express an EXPANDABLE blockquote "
+                "-> sending a normal blockquote instead. Upgrade the library "
+                "(see requirements.txt).",
+            )
+
+        if BLOCKQUOTE is not None:
+            self._add(type=BLOCKQUOTE, **base)
+        elif EXPANDABLE_BLOCKQUOTE is not None:
+            self._add(type=EXPANDABLE_BLOCKQUOTE, **base)
+
+    # ---- HTMLParser callbacks -----------------------------------------
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
-        attrs_dict = dict(attrs)
+        a = dict(attrs)
+
+        if tag == "br":
+            self.handle_data("\n")
+            return
+        if tag == "span":
+            if "tg-spoiler" in (a.get("class") or ""):
+                tag = "tg-spoiler"
+            else:
+                return
+
         if tag == "a":
-            self._stack.append(_OpenTag(tag, self._offset, href=attrs_dict.get("href")))
+            self._stack.append(_OpenTag("a", self._offset, href=a.get("href")))
         elif tag == "blockquote":
-            # HTMLParser reports a valueless attribute like `expandable` as
-            # (name, None) -- its mere presence is what matters, not a value.
-            is_expandable = "expandable" in attrs_dict
-            self._stack.append(_OpenTag(tag, self._offset, expandable=is_expandable))
+            nested = any(t.name == "blockquote" for t in self._stack)
+            # `expandable` is a valueless attribute -> (name, None); presence matters.
+            self._stack.append(
+                _OpenTag("blockquote", self._offset, expandable=("expandable" in a), noop=nested)
+            )
+        elif tag == "pre":
+            self._stack.append(_OpenTag("pre", self._offset, language=a.get("language")))
         elif tag in _TAG_TO_ENTITY:
             self._stack.append(_OpenTag(tag, self._offset))
-        # Unknown tags are silently ignored (no entity), matching graceful
-        # degradation rather than raising on an unexpected tag.
+        # unknown tags: ignored (their text is kept)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
-        # Pop the most recent matching open tag (supports simple nesting).
+        if tag == "span":
+            tag = "tg-spoiler"
         for i in range(len(self._stack) - 1, -1, -1):
             if self._stack[i].name == tag:
-                open_tag = self._stack.pop(i)
-                length = self._offset - open_tag.start_offset
-                if length <= 0:
-                    return
-                if tag == "a":
-                    if open_tag.href:
-                        self.entities.append(
-                            MessageEntity(
-                                type=MessageEntityType.TEXT_LINK,
-                                offset=open_tag.start_offset,
-                                length=length,
-                                url=open_tag.href,
-                            )
-                        )
-                elif tag == "blockquote":
-                    if not BLOCKQUOTE_SUPPORTED:
-                        raise RuntimeError(
-                            "This Pyrogram installation has no "
-                            "MessageEntityType.BLOCKQUOTE -- blockquote "
-                            "entities are not supported at all by this "
-                            "build. Upgrade Pyrogram to a version/fork "
-                            "that implements Bot API 7.5's blockquote "
-                            "entity; no client-side workaround is possible."
-                        )
-                    kwargs = {}
-                    if open_tag.expandable:
-                        kwargs[BLOCKQUOTE_EXPANDABLE_KWARG] = True
-                    self.entities.append(
-                        MessageEntity(
-                            type=MessageEntityType.BLOCKQUOTE,
-                            offset=open_tag.start_offset,
-                            length=length,
-                            **kwargs,
-                        )
-                    )
-                else:
-                    self.entities.append(
-                        MessageEntity(
-                            type=_TAG_TO_ENTITY[tag],
-                            offset=open_tag.start_offset,
-                            length=length,
-                        )
-                    )
+                self._emit(self._stack.pop(i))
                 return
 
     def handle_data(self, data):
         self.plain_parts.append(data)
         self._offset += _utf16_len(data)
 
+    def finish(self):
+        # close anything left open, innermost first
+        while self._stack:
+            self._emit(self._stack.pop())
+
+
+_TAG_RE = re.compile(r"<[^>]*>")
+
 
 def parse_html(html_text: str) -> tuple[str, list[MessageEntity]]:
     """
-    Convert an HTML string built by caption_builder.py into
-    (plain_text, entities) using this module's own parser, independent of
-    whatever the ambient Pyrogram build's parse_mode HTML support does or
-    does not implement for <blockquote>.
+    Convert the bot's HTML into (plain_text, entities). Never raises.
     """
-    parser = _EntityHTMLParser()
-    parser.feed(html_text or "")
-    parser.close()
-    plain_text = "".join(parser.plain_parts)
-    # Entities must be sorted by offset for Telegram to render them reliably.
-    entities = sorted(parser.entities, key=lambda e: e.offset)
-    return plain_text, entities
+    html_text = html_text or ""
+    try:
+        parser = _EntityHTMLParser()
+        parser.feed(html_text)
+        parser.close()
+        parser.finish()
+        plain_text = "".join(parser.plain_parts)
+        entities = sorted(parser.entities, key=lambda e: (e.offset, -e.length))
+        return plain_text, entities
+    except Exception as e:  # pragma: no cover - last-resort safety net
+        LOGGER.exception(f"[html_entities] parse_html failed, stripping tags: {e}")
+        return _html.unescape(_TAG_RE.sub("", html_text)), []
