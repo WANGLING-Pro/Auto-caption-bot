@@ -3,27 +3,18 @@ main.py
 -------
 Entry point.
 
-CRITICAL ORDERING: the keep-alive HTTP server is bound and started as the
-FIRST executable code in this file -- before importing pyrogram, before
-Config.validate(), before anything else that could conceivably raise,
-hang, or take time. This makes it structurally impossible for bot-side
-startup work (Telegram handshake, Mongo connection, plugin loading) to
-delay or block Render's port scan.
+The keep-alive HTTP server is started FIRST (before importing pyrogram or
+validating config) so Render's port scan always succeeds. Every boot phase
+prints an unbuffered marker so the Render log shows exactly how far startup
+got.
 
-Every phase below also prints an unbuffered marker line. This is
-deliberate: Render pipes stdout, and Python block-buffers stdout when it
-isn't a TTY, so print()/logging output can sit invisible in a buffer for
-a long time. A process can be working correctly and still look "silent"
-or "hung" in the dashboard purely because of buffering. These print(...,
-flush=True) markers exist to give unambiguous, real-time proof of exactly
-how far execution has gotten, on every deploy, from now on.
+Review changes: logs Python / Pyrogram versions at boot (so you can see which
+interpreter and library Render actually used), and tells you if the Python
+version is not the one in .python-version.
 """
 
 import sys
 
-# Force line-buffered (effectively unbuffered) stdout/stderr immediately,
-# before anything else runs, so every print below actually reaches the log
-# viewer in real time instead of sitting in a buffer.
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -45,10 +36,18 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
+import pyrogram  # noqa: E402
 from pyrogram import Client  # noqa: E402
 
 from config import Config  # noqa: E402
 from utils.logger import LOGGER  # noqa: E402
+
+print(f"[BOOT] python={sys.version.split()[0]} pyrogram={getattr(pyrogram, '__version__', '?')}", flush=True)
+if sys.version_info[:2] != (3, 11):
+    LOGGER.warning(
+        f"Running on Python {sys.version.split()[0]}, but this project targets 3.11. "
+        "Render ignores runtime.txt: add a .python-version file (or PYTHON_VERSION env var)."
+    )
 
 print("[BOOT] validating config...", flush=True)
 Config.validate()
